@@ -14,6 +14,7 @@ import tkinter as tk
 import config
 import settings_window
 
+_WM_LBUTTONDBLCLK = 0x0203
 _WM_RBUTTONUP = 0x0205
 _WM_CONTEXTMENU = 0x007B
 _WM_NULL = 0x0000
@@ -115,6 +116,7 @@ class TrayApp:
         self._hwnd = 0
         self._added = False
         self._menu_requested = False
+        self._settings_requested = False
         self._showing_menu = False
         self._settings: settings_window.SettingsEditor | None = None
 
@@ -161,6 +163,12 @@ class TrayApp:
         """
         if not self._added:
             return
+        if self._settings_requested:
+            self._settings_requested = False
+            try:
+                self.open_settings()
+            except Exception:
+                pass
         if self._menu_requested and not self._showing_menu:
             self._menu_requested = False
             self._showing_menu = True
@@ -223,6 +231,9 @@ class TrayApp:
 
     def _on_message(self, hwnd, msg, wparam, lparam):
         try:
+            if msg == _CALLBACK and (int(lparam) & 0xFFFF) == _WM_LBUTTONDBLCLK:
+                self._settings_requested = True
+                return 0
             if msg == _CALLBACK and (int(lparam) & 0xFFFF) in {_WM_RBUTTONUP, _WM_CONTEXTMENU}:
                 self._menu_requested = True
                 return 0

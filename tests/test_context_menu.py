@@ -84,7 +84,7 @@ class ContextMenuTest(unittest.TestCase):
                 self.assertEqual(context_menu.install(exe, settings), 0)
                 items = context_menu.menu_items(settings)
                 commands = {context_menu.PROCESS_COMMAND_KEY: "--process-all"}
-                expected_titles = {context_menu.PROCESS_KEY: "Обработать всё"}
+                expected_titles = {context_menu.PROCESS_KEY: "Запустить все"}
                 expected_icons = {context_menu.PROCESS_KEY: None}
                 for item in items:
                     commands[item.command_key] = item.flag

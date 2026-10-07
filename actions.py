@@ -2,7 +2,7 @@
 
 Подтверждения и итоги показываются стандартным окном Windows.
 Чтение XMP остаётся в move_green.read_xmp_label.
-«Обработать всё» берёт действие каждой метки из config.json.
+«Запустить все» берёт действие каждой метки из config.json.
 """
 
 from __future__ import annotations

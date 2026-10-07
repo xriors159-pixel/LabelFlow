@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -37,7 +38,14 @@ JPEG_SUFFIXES = {".jpg", ".jpeg"}
 XMP_NAMESPACE = "http://ns.adobe.com/xap/1.0/"
 XMP_LABEL = f"{{{XMP_NAMESPACE}}}Label"
 XMP_RATING = f"{{{XMP_NAMESPACE}}}Rating"
+MS_PHOTO_NAMESPACE = "http://ns.microsoft.com/photo/1.0/"
+MS_PHOTO_RATING = f"{{{MS_PHOTO_NAMESPACE}}}Rating"
 XMP_APP1_SIGNATURE = b"http://ns.adobe.com/xap/1.0/\x00"
+EXIF_APP1_SIGNATURE = b"Exif\x00\x00"
+_EXIF_RATING = 0x4746
+_EXIF_RATING_PERCENT = 0x4749
+# Проценты, которыми Проводник Windows записывает звёзды.
+_PERCENT_STARS = {1: 1, 25: 2, 50: 3, 75: 4, 99: 5, 100: 5}
 
 # Маркеры JPEG без поля длины.
 _STANDALONE_MARKERS = frozenset([0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)])
@@ -61,11 +69,14 @@ def _configure_stdio() -> None:
 
 
 def _iter_xmp_packets(path: Path):
-    """Отдаёт стандартные XMP-пакеты из APP1, не читая сжатые данные снимка.
+    """Отдаёт стандартные XMP-пакеты из APP1, не читая сжатые данные снимка."""
+    for kind, payload in _iter_metadata(path):
+        if kind == "xmp":
+            yield payload
 
-    Сканирование останавливается на SOS: дальше идут коэффициенты изображения,
-    а не метаданные.
-    """
+
+def _iter_metadata(path: Path):
+    """XMP и EXIF из APP1. Сканирование останавливается на SOS."""
     with path.open("rb") as handle:
         if handle.read(2) != b"\xff\xd8":
             return
@@ -87,7 +98,9 @@ def _iter_xmp_packets(path: Path):
             if len(payload) != segment_length - 2:
                 return
             if marker == 0xE1 and payload.startswith(XMP_APP1_SIGNATURE):
-                yield payload[len(XMP_APP1_SIGNATURE) :]
+                yield "xmp", payload[len(XMP_APP1_SIGNATURE) :]
+            elif marker == 0xE1 and payload.startswith(EXIF_APP1_SIGNATURE):
+                yield "exif", payload[len(EXIF_APP1_SIGNATURE) :]
             if marker == _SOS_MARKER:
                 return
 
@@ -135,36 +148,113 @@ def _label_from_xmp_packet(packet: bytes) -> str | None:
     return None
 
 
-def _rating_value(raw: str | None) -> int | None:
+def _rating_text(element: ET.Element) -> str:
+    text = (element.text or "").strip()
+    if text:
+        return text
+    for child in element.iter():
+        if child is element:
+            continue
+        nested = (child.text or "").strip()
+        if nested:
+            return nested
+    return ""
+
+
+def _stars_from_count(raw: str | None) -> int | None:
+    """1–5, либо столько же символов ★ или *."""
     if raw is None:
         return None
     text = raw.strip()
     if text in {"1", "2", "3", "4", "5"}:
         return int(text)
+    if text and set(text) <= {"★"} and 1 <= len(text) <= 5:
+        return len(text)
+    if text and set(text) <= {"*"} and 1 <= len(text) <= 5:
+        return len(text)
     return None
 
 
-def _fields_from_xmp_packet(packet: bytes) -> tuple[str | None, int | None]:
-    """Метка и рейтинг из одного пакета. Разбор Label не меняется."""
+def _stars_from_percent(raw: str | None) -> int | None:
+    counted = _stars_from_count(raw)
+    if counted is not None:
+        return counted
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        return None
+    return _PERCENT_STARS.get(int(text))
+
+
+def _rating_value(raw: str | None) -> int | None:
+    return _stars_from_count(raw)
+
+
+def _fields_from_xmp_packet(packet: bytes) -> tuple[str | None, int | None, int | None]:
+    """Метка, xmp:Rating и MicrosoftPhoto:Rating. Разбор Label не меняется."""
     root = _parse_xmp_root(packet)
     if root is None:
-        return None, None
+        return None, None, None
     label = None
-    rating = None
+    xmp_rating = None
+    ms_rating = None
     for element in root.iter():
         if label is None:
             if XMP_LABEL in element.attrib:
                 label = element.attrib[XMP_LABEL]
             elif element.tag == XMP_LABEL:
                 label = element.text or ""
-        if rating is None:
+        if xmp_rating is None:
             if XMP_RATING in element.attrib:
-                rating = _rating_value(element.attrib[XMP_RATING])
+                xmp_rating = _stars_from_count(element.attrib[XMP_RATING])
             elif element.tag == XMP_RATING:
-                rating = _rating_value(element.text or "")
-        if label is not None and rating is not None:
+                xmp_rating = _stars_from_count(_rating_text(element))
+        if ms_rating is None:
+            if MS_PHOTO_RATING in element.attrib:
+                ms_rating = _stars_from_percent(element.attrib[MS_PHOTO_RATING])
+            elif element.tag == MS_PHOTO_RATING:
+                ms_rating = _stars_from_percent(_rating_text(element))
+        if label is not None and xmp_rating is not None and ms_rating is not None:
             break
-    return label, rating
+    return label, xmp_rating, ms_rating
+
+
+def _ratings_from_exif(payload: bytes) -> tuple[int | None, int | None]:
+    """EXIF Rating (1–5) и RatingPercent из IFD0. Битый сегмент даёт пустой результат."""
+    if len(payload) < 8:
+        return None, None
+    if payload[:2] == b"II":
+        order = "little"
+    elif payload[:2] == b"MM":
+        order = "big"
+    else:
+        return None, None
+    if int.from_bytes(payload[2:4], order) != 42:
+        return None, None
+    offset = int.from_bytes(payload[4:8], order)
+    if offset < 0 or offset + 2 > len(payload):
+        return None, None
+    count = int.from_bytes(payload[offset : offset + 2], order)
+    rating = None
+    percent = None
+    entry = offset + 2
+    for _ in range(min(count, 256)):
+        if entry + 12 > len(payload):
+            break
+        tag = int.from_bytes(payload[entry : entry + 2], order)
+        kind = int.from_bytes(payload[entry + 2 : entry + 4], order)
+        number = int.from_bytes(payload[entry + 4 : entry + 8], order)
+        raw = payload[entry + 8 : entry + 12]
+        if number == 1 and kind in {3, 4}:
+            width = 2 if kind == 3 else 4
+            value = int.from_bytes(raw[:width], order)
+            if tag == _EXIF_RATING and value in {1, 2, 3, 4, 5}:
+                rating = value
+            elif tag == _EXIF_RATING_PERCENT:
+                percent = _PERCENT_STARS.get(value)
+        entry += 12
+    return rating, percent
 
 
 def read_xmp_label(path: Path) -> str | None:
@@ -177,18 +267,134 @@ def read_xmp_label(path: Path) -> str | None:
 
 
 def read_xmp_fields(path: Path) -> tuple[str | None, int | None]:
-    """xmp:Label и xmp:Rating (1–5) за один проход по APP1."""
+    """Метка и звёзды: xmp:Rating, символы ★/*, MicrosoftPhoto:Rating, EXIF.
+
+    Если в файле несколько записей, берётся первая найденная в этом порядке.
+    Числовой xmp:Rating важнее процентов Windows и тегов EXIF.
+    Когда в файле звёзд нет, берётся рейтинг из каталога XnView MP.
+    """
     label = None
-    rating = None
-    for packet in _iter_xmp_packets(path):
-        found_label, found_rating = _fields_from_xmp_packet(packet)
-        if label is None and found_label is not None:
-            label = found_label
-        if rating is None and found_rating is not None:
-            rating = found_rating
-        if label is not None and rating is not None:
+    xmp_rating = None
+    ms_rating = None
+    exif_rating = None
+    exif_percent = None
+    for kind, payload in _iter_metadata(path):
+        if kind == "xmp":
+            found_label, found_xmp, found_ms = _fields_from_xmp_packet(payload)
+            if label is None and found_label is not None:
+                label = found_label
+            if xmp_rating is None and found_xmp is not None:
+                xmp_rating = found_xmp
+            if ms_rating is None and found_ms is not None:
+                ms_rating = found_ms
+        else:
+            found_rating, found_percent = _ratings_from_exif(payload)
+            if exif_rating is None and found_rating is not None:
+                exif_rating = found_rating
+            if exif_percent is None and found_percent is not None:
+                exif_percent = found_percent
+        if label is not None and xmp_rating is not None:
             break
+    if xmp_rating is not None:
+        rating = xmp_rating
+    elif ms_rating is not None:
+        rating = ms_rating
+    elif exif_rating is not None:
+        rating = exif_rating
+    else:
+        rating = exif_percent
+    if rating is None:
+        rating = xnview_catalog_rating(path)
     return label, rating
+
+
+def _xnview_db_path() -> Path | None:
+    """Каталог XnView MP. Звёзды из него не всегда записаны в JPEG."""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    path = Path(appdata) / "XnViewMP" / "XnView.db"
+    if path.is_file():
+        return path
+    return None
+
+
+def _folder_path_variants(folder: Path) -> list[str]:
+    """Варианты пути, как их хранит XnView: прямые слэши и слэш в конце."""
+    seen: list[str] = []
+    candidates = [folder]
+    try:
+        candidates.append(folder.resolve())
+    except OSError:
+        pass
+    for item in candidates:
+        text = str(item).replace("/", "\\")
+        forward = text.replace("\\", "/")
+        slash = forward if forward.endswith("/") else forward + "/"
+        for value in (slash, forward, text):
+            if value not in seen:
+                seen.append(value)
+    return seen
+
+
+_xnview_cache: dict[tuple[str, int, str], dict[str, int]] = {}
+
+
+def xnview_catalog_rating(path: Path) -> int | None:
+    """Рейтинг 1–5 из каталога XnView для этого файла, если программа его записала."""
+    table = _xnview_folder_ratings(path.parent)
+    if not table:
+        return None
+    return table.get(path.name.casefold())
+
+
+def _xnview_folder_ratings(folder: Path) -> dict[str, int]:
+    db = _xnview_db_path()
+    if db is None:
+        return {}
+    try:
+        stamp = db.stat().st_mtime_ns
+    except OSError:
+        return {}
+    key = (os.path.normcase(str(db)), stamp, os.path.normcase(os.path.abspath(folder)))
+    cached = _xnview_cache.get(key)
+    if cached is not None:
+        return cached
+    loaded = _query_xnview_ratings(db, folder)
+    _xnview_cache[key] = loaded
+    return loaded
+
+
+def _query_xnview_ratings(db: Path, folder: Path) -> dict[str, int]:
+    uri = "file:" + db.resolve().as_posix() + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return {}
+    try:
+        folder_id = None
+        for name in _folder_path_variants(folder):
+            row = connection.execute(
+                "SELECT FolderID FROM Folders WHERE Pathname = ? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+            if row is not None:
+                folder_id = row[0]
+                break
+        if folder_id is None:
+            return {}
+        found: dict[str, int] = {}
+        for filename, rating in connection.execute(
+            "SELECT Filename, Rating FROM Images WHERE FolderID = ?",
+            (folder_id,),
+        ):
+            if isinstance(rating, int) and rating in {1, 2, 3, 4, 5} and isinstance(filename, str):
+                found[filename.casefold()] = rating
+        return found
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
 
 
 def _jpeg_files(folder: Path) -> tuple[list[Path], list[str]]:

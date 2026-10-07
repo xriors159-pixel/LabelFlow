@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -278,6 +279,149 @@ class XmpLabelDetectionTest(unittest.TestCase):
             env=env,
             check=False,
         )
+
+    def _temp_dir(self):
+        return tempfile_directory()
+
+
+def _exif_app1(rating: int | None = None, percent: int | None = None, big: bool = False) -> bytes:
+    order = "big" if big else "little"
+    mark = b"MM" if big else b"II"
+    entries = bytearray()
+    count = 0
+    for tag, value in ((0x4746, rating), (0x4749, percent)):
+        if value is None:
+            continue
+        entries += tag.to_bytes(2, order)
+        entries += (3).to_bytes(2, order)
+        entries += (1).to_bytes(4, order)
+        entries += value.to_bytes(2, order) + b"\x00\x00"
+        count += 1
+    body = mark + (42).to_bytes(2, order) + (8).to_bytes(4, order)
+    body += count.to_bytes(2, order) + bytes(entries) + b"\x00\x00\x00\x00"
+    return _app1(b"Exif\x00\x00" + body)
+
+
+class StarMetadataTest(unittest.TestCase):
+    def test_star_marks_and_windows_percents_and_exif(self) -> None:
+        with self._temp_dir() as folder:
+            marks = _write(
+                folder,
+                "marks.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
+                    '    xmp:Rating="★★★"/>'
+                ))),
+            )
+            asterisks = _write(
+                folder,
+                "asterisks.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/">\n'
+                    "   <xmp:Rating>****</xmp:Rating>\n"
+                    "  </rdf:Description>"
+                ))),
+            )
+            windows = _write(
+                folder,
+                "windows.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0/"\n'
+                    '    MicrosoftPhoto:Rating="75"/>'
+                ))),
+            )
+            nested = _write(
+                folder,
+                "nested.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0/">\n'
+                    "   <MicrosoftPhoto:Rating>50</MicrosoftPhoto:Rating>\n"
+                    "  </rdf:Description>"
+                ))),
+            )
+            exif_stars = _write(folder, "exif.jpg", _jpeg(_exif_app1(rating=5)))
+            exif_percent = _write(folder, "percent.jpg", _jpeg(_exif_app1(percent=1, big=True)))
+            preferred = _write(
+                folder,
+                "preferred.jpg",
+                _jpeg(
+                    _exif_app1(rating=5),
+                    _app1(XMP_SIGNATURE + _packet(
+                        '  <rdf:Description rdf:about=""\n'
+                        '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
+                        '    xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0/"\n'
+                        '    xmp:Label="Зеленый"\n'
+                        '    xmp:Rating="2"\n'
+                        '    MicrosoftPhoto:Rating="99"/>'
+                    )),
+                ),
+            )
+            not_percent = _write(
+                folder,
+                "not-percent.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
+                    '    xmp:Rating="99"/>'
+                ))),
+            )
+
+            self.assertEqual(move_green.read_xmp_fields(marks)[1], 3)
+            self.assertEqual(move_green.read_xmp_fields(asterisks)[1], 4)
+            self.assertEqual(move_green.read_xmp_fields(windows)[1], 4)
+            self.assertEqual(move_green.read_xmp_fields(nested)[1], 3)
+            self.assertEqual(move_green.read_xmp_fields(exif_stars)[1], 5)
+            self.assertEqual(move_green.read_xmp_fields(exif_percent)[1], 1)
+            self.assertEqual(move_green.read_xmp_fields(preferred), ("Зеленый", 2))
+            self.assertEqual(move_green.read_xmp_label(preferred), "Зеленый")
+            self.assertIsNone(move_green.read_xmp_fields(not_percent)[1])
+
+    def test_xnview_catalog_rating_fills_unrated_file(self) -> None:
+        import sqlite3
+
+        with self._temp_dir() as folder:
+            photo = _write(
+                folder,
+                "02224.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
+                    '    xmp:Label="Нет"\n'
+                    '    xmp:Rating="0"/>'
+                ))),
+            )
+            embedded = _write(
+                folder,
+                "kept.jpg",
+                _jpeg(_app1(XMP_SIGNATURE + _packet(
+                    '  <rdf:Description rdf:about=""\n'
+                    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
+                    '    xmp:Rating="4"/>'
+                ))),
+            )
+            database = folder / "XnView.db"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE Folders (FolderID INTEGER PRIMARY KEY, Pathname TEXT)")
+            connection.execute(
+                "CREATE TABLE Images (ImageID INTEGER PRIMARY KEY, FolderID INTEGER, Filename TEXT, Rating INTEGER)"
+            )
+            stored = str(folder.resolve()).replace("\\", "/")
+            if not stored.endswith("/"):
+                stored += "/"
+            connection.execute("INSERT INTO Folders (FolderID, Pathname) VALUES (1, ?)", (stored,))
+            connection.execute(
+                "INSERT INTO Images (FolderID, Filename, Rating) VALUES (1, '02224.jpg', 1), (1, 'kept.jpg', 2)"
+            )
+            connection.commit()
+            connection.close()
+            move_green._xnview_cache.clear()
+            with unittest.mock.patch.object(move_green, "_xnview_db_path", return_value=database):
+                self.assertEqual(move_green.read_xmp_fields(photo), ("Нет", 1))
+                self.assertEqual(move_green.read_xmp_fields(embedded)[1], 4)
 
     def _temp_dir(self):
         return tempfile_directory()

@@ -513,6 +513,33 @@ class StarRatingTest(unittest.TestCase):
             self.assertTrue((scanned.parent / "Двойка" / "stars.jpg").is_file())
             self.assertTrue((scanned.parent / "Подрядчики" / "green-stars.jpg").is_file())
 
+    def test_windows_and_exif_stars_use_star_filters(self) -> None:
+        with tempfile_directory() as root:
+            scanned = _album(root)
+            from tests.test_xmp_label import _exif_app1
+
+            windows = (
+                '  <rdf:Description rdf:about=""\n'
+                '    xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0/"\n'
+                '    MicrosoftPhoto:Rating="99"/>'
+            )
+            _write(scanned, "windows.jpg", _jpeg(_app1(XMP_SIGNATURE + _packet(windows))))
+            _write(scanned, "exif.jpg", _jpeg(_exif_app1(rating=1)))
+            settings = config.default_settings()
+            settings.set_rule("green", config.LabelRule(False, "none", ""))
+            settings.set_rule("orange", config.LabelRule(False, "none", ""))
+            settings.set_rule("star5", config.LabelRule(True, "move", "Пять"))
+            settings.set_rule("star1", config.LabelRule(True, "move", "Одна"))
+            code = actions.process_all(
+                scanned,
+                confirm=lambda text: True,
+                notify=lambda text: None,
+                settings=settings,
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue((scanned.parent / "Пять" / "windows.jpg").is_file())
+            self.assertTrue((scanned.parent / "Одна" / "exif.jpg").is_file())
+
 
 class FolderLocationTest(unittest.TestCase):
     def test_three_places_receive_their_files(self) -> None:

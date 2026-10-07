@@ -1,7 +1,7 @@
 """Регистрация плоского меню LabelFlow в контекстном меню папок.
 
 Пункты берутся из config.json:
-    Обработать всё
+    Запустить все
     затем каждое включённое «Переместить …»
     затем каждое включённое «Открыть …»
 
@@ -24,7 +24,7 @@ SHELL_KEY = r"Software\Classes\Directory\shell\LabelFlow"
 MENU_KEY = r"Software\Classes\Directory\ContextMenus\LabelFlow"
 EXTENDED_SUBCOMMANDS = r"Directory\ContextMenus\LabelFlow"
 
-PROCESS_TITLE = "Обработать всё"
+PROCESS_TITLE = "Запустить все"
 EXPLORER_ICON = r"%SystemRoot%\explorer.exe,0"
 
 PROCESS_KEY = MENU_KEY + r"\shell\01ProcessAll"
@@ -98,7 +98,7 @@ class MenuItem:
 
 
 def menu_items(settings: config.Settings) -> list[MenuItem]:
-    """Пункты под «Обработать всё»: сначала переносы, затем запуск программ."""
+    """Пункты под «Запустить все»: сначала переносы, затем запуск программ."""
     moves: list[tuple[str, str]] = []
     opens: list[tuple[str, str, str]] = []
     for item in config.LABELS:
